@@ -1,6 +1,22 @@
 # Diagnosi Wi-Fi – Swisscom Internet-Box
 
-Script per Windows che trova cosa rallenta il Wi-Fi di casa. Funziona **solo in lettura**: non modifica nessuna impostazione del router.
+Script che trova cosa rallenta il Wi-Fi di casa. Funziona **solo in lettura**: non modifica nessuna impostazione del router.
+
+## iPhone (consigliato)
+
+1. Installa l'app gratuita **a-Shell** dall'App Store.
+2. Collegati al Wi-Fi di casa e apri a-Shell.
+3. Scrivi questi due comandi:
+   ```
+   curl -L -o wifi.py https://raw.githubusercontent.com/RealGiX/RealGix-/main/wifi_diagnosi.py
+   python3 wifi.py
+   ```
+4. Alla richiesta, inserisci la password della Internet-Box.
+5. Il risultato appare subito sullo schermo. Il report completo si apre da **File → Sul mio iPhone → a-Shell**.
+
+La prossima volta basta `python3 wifi.py`. Con iPhone la scansione delle reti vicine la fa il router stesso; il segnale del telefono viene letto dalla Internet-Box.
+
+## Windows
 
 ## Cosa controlla
 
