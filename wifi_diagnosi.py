@@ -19,7 +19,9 @@ import re
 import socket
 import statistics
 import sys
+import ssl
 import time
+import urllib.error
 import urllib.request
 
 ROUTER = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.1"
@@ -97,17 +99,45 @@ def nome(c):
 
 
 # ------------------------------------------------------------------ Internet-Box
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # niente redirect: altrimenti la POST diventa GET e si perde il corpo
+
+
 class Box:
     def __init__(self, host):
-        self.url = f"http://{host}/ws"
+        self.host = host
+        self.urls = [f"http://{host}/ws", f"https://{host}/ws"]
+        self.url = self.urls[0]
         self.ctx = None
         self.cookie = None
+        self.errori = []
+        # Il router usa un certificato autofirmato: si accetta solo per questo indirizzo locale.
+        sslctx = ssl.create_default_context()
+        sslctx.check_hostname = False
+        sslctx.verify_mode = ssl.CERT_NONE
+        self.opener = urllib.request.build_opener(_NoRedirect(), urllib.request.HTTPSHandler(context=sslctx))
 
     def _post(self, payload, headers, timeout=15):
         body = json.dumps(payload).encode("utf-8")
-        h = {"Content-Type": CT, **headers}
-        req = urllib.request.Request(self.url, data=body, headers=h, method="POST")
-        return urllib.request.urlopen(req, timeout=timeout)
+        h = {"Content-Type": CT, "Accept": "*/*", "User-Agent": "Mozilla/5.0", **headers}
+        ultimo = None
+        for url in [self.url] + [u for u in self.urls if u != self.url]:
+            req = urllib.request.Request(url, data=body, headers=h, method="POST")
+            try:
+                r = self.opener.open(req, timeout=timeout)
+                self.url = url
+                return r
+            except urllib.error.HTTPError as e:
+                ultimo = e
+                self.errori.append(f"{url} {payload.get('service')}.{payload.get('method')}: HTTP {e.code} {e.headers.get('Location', '')}")
+                if e.code in (401, 403):  # il server c'è, serve l'accesso: inutile provare l'altro indirizzo
+                    self.url = url
+                    raise
+            except Exception as e:
+                ultimo = e
+                self.errori.append(f"{url} {payload.get('service')}.{payload.get('method')}: {type(e).__name__} {e}")
+        raise ultimo
 
     def call(self, service, method, params=None, auth=False, timeout=15):
         h = {"X-Requested-With": "XMLHttpRequest"}
@@ -163,22 +193,33 @@ def tcp_latency(host, port, n=20):
     return r
 
 
+SPEED_URLS = [
+    "https://speed.cloudflare.com/__down?bytes=100000000",
+    "https://proof.ovh.net/files/100Mb.dat",
+    "https://speedtest.init7.net/1GB.dd",
+    "http://speedtest.tele2.net/100MB.zip",
+]
+
+
 def speedtest(secondi=8):
-    try:
-        req = urllib.request.Request("https://speed.cloudflare.com/__down?bytes=200000000",
-                                     headers={"User-Agent": "wifi-diagnosi"})
-        tot, s = 0, time.perf_counter()
-        with urllib.request.urlopen(req, timeout=10) as r:
-            while time.perf_counter() - s < secondi:
-                b = r.read(262144)
-                if not b:
-                    break
-                tot += len(b)
-        el = time.perf_counter() - s
-        return round(tot * 8 / 1e6 / el, 1) if el > 0 else None
-    except Exception as e:
-        print(f"   Speedtest non riuscito: {e}")
-        return None
+    ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+    for url in SPEED_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
+            tot, s = 0, time.perf_counter()
+            with urllib.request.urlopen(req, timeout=10) as r:
+                while time.perf_counter() - s < secondi:
+                    b = r.read(262144)
+                    if not b:
+                        break
+                    tot += len(b)
+            el = time.perf_counter() - s
+            if tot > 1_000_000 and el > 0:
+                return round(tot * 8 / 1e6 / el, 1)
+        except Exception as e:
+            print(f"   ({url.split('/')[2]} non disponibile: {e})")
+    print("   Speedtest non riuscito.")
+    return None
 
 
 def mio_ip():
@@ -242,10 +283,29 @@ box = Box(ROUTER)
 info = (box.call("DeviceInfo", "get") or {}).get("status")
 clienti, aps, tel = [], [], None
 if not info:
-    print("   La Internet-Box non risponde.")
-    add(0, "Router", "Impossibile leggere i dati della Internet-Box", f"Nessuna risposta da {box.url}.",
-        "Verifica di essere sul Wi-Fi di casa. Se il router ha un altro indirizzo: python3 wifi.py <indirizzo>.")
+    print("   Il router non dà dati senza accesso: provo con la password.")
+try:
+    pw = getpass.getpass(f"   Password della Internet-Box (utente '{UTENTE}', Invio per saltare): ")
+except Exception:
+    pw = input(f"   Password della Internet-Box (utente '{UTENTE}', Invio per saltare): ")
+if pw and box.login(UTENTE, pw):
+    print("   Accesso riuscito.")
+elif pw:
+    print("   Accesso non riuscito (password errata?).")
+    add(0, "Router", "Accesso alla Internet-Box non riuscito", "Senza accesso non si vedono dispositivi e canali.",
+        "Rilancia con la password dell'interfaccia web (quella di http://internetbox.home).")
+pw = None
+if not info and box.ctx:
+    info = (box.call("DeviceInfo", "get", auth=True) or {}).get("status") or {}
+dati["box_errori"] = box.errori[-10:]
+if not info and not box.ctx:
+    print("   La Internet-Box non risponde. Dettagli tecnici:")
+    for e in box.errori[-4:]:
+        print(f"     {e}")
+    add(0, "Router", "Impossibile leggere i dati della Internet-Box", "; ".join(box.errori[-3:]) or f"Nessuna risposta da {box.url}.",
+        "Manda una foto di questa schermata a chi mantiene lo script.")
 else:
+    info = info or {}
     up_g = round((num(info.get("UpTime")) or 0) / 86400, 1)
     print(f"   {info.get('Manufacturer', '')} {info.get('ModelName', '')} - firmware {info.get('SoftwareVersion', '')} - acceso da {up_g} giorni")
     dati["box"] = {"modello": info.get("ModelName"), "firmware": info.get("SoftwareVersion"), "acceso_giorni": up_g}
@@ -253,23 +313,11 @@ else:
         add(1, "Router", f"Il router è acceso da {up_g} giorni senza riavvio",
             "Dopo molte settimane alcuni router accumulano rallentamenti.",
             "Riavvia la Internet-Box (staccala 30 secondi): è un test gratuito.")
-    wan = (box.call("NMC", "getWANStatus") or {}).get("data") or {}
+    wan = (box.call("NMC", "getWANStatus", auth=True) or {}).get("data") or {}
     dati["box"]["linea"] = wan
     if wan and wan.get("LinkState") != "up":
         add(3, "Linea Internet", f"Linea Internet non attiva ({wan.get('LinkState')})", "Il router segnala la linea giù.",
             "Controlla i cavi e lo stato su swisscom.ch o chiama il supporto.")
-
-    try:
-        pw = getpass.getpass(f"   Password della Internet-Box (utente '{UTENTE}', Invio per saltare): ")
-    except Exception:
-        pw = input(f"   Password della Internet-Box (utente '{UTENTE}', Invio per saltare): ")
-    if pw and box.login(UTENTE, pw):
-        print("   Accesso riuscito.")
-    elif pw:
-        print("   Accesso non riuscito (password errata?). Continuo con i dati pubblici.")
-        add(0, "Router", "Accesso alla Internet-Box non riuscito", "Senza accesso non si vedono dispositivi e canali.",
-            "Rilancia con la password dell'interfaccia web (quella di http://internetbox.home).")
-    pw = None
 
     wifi = (box.call("NMC.Wifi", "get", auth=True) or {}).get("data") or {}
     dati["box"]["wifi"] = wifi
